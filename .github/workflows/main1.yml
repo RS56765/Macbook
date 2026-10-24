@@ -1,0 +1,89 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    steps:
+      - name: Power Process Optimization
+        run: |
+          Write-Host "Optimizing CPU Cores and Thread allocation..."
+          # Windows execution environment ko optimize karna
+          $env:NUMBER_OF_PROCESSORS = 4
+          [System.Environment]::SetEnvironmentVariable("NUMBER_OF_PROCESSORS", "4", "Machine")
+          
+          # System throttling disable karna taaki full background power mile
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name "PowerThrottlingOff" -Value 1 -Force -ErrorAction SilentlyContinue
+          
+          # Virtual Memory Paging File optimize karna lag kam karne ke liye
+          Set-CimInstance -Query "Select * from Win32_PageFileSetting" -Property @{InitialSize = 4096; MaximumSize = 8192} -ErrorAction SilentlyContinue
+          Write-Host "Power Optimization Complete!"
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          $upper   = -join ((65..90) | Get-Random -Count 4 | ForEach-Object {[char]$_})
+          $lower   = -join ((97..122) | Get-Random -Count 4 | ForEach-Object {[char]$_})
+          $numbers = -join ((48..57) | Get-Random -Count 4 | ForEach-Object {[char]$_})
+          $special = "Pass!@"
+          $password = "${upper}${lower}${numbers}${special}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale via Chocolatey
+        run: |
+          choco install tailscale -y
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
+      - name: Establish Tailscale Connection
+        run: |
+          $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+          Write-Host "Connecting to Tailscale..."
+          Start-Process $tailscaleExe -ArgumentList "up", "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=gh-runner-$env:GITHUB_RUN_ID" -Wait
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & $tailscaleExe ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Set High Priority for RDP Session
+        run: |
+          # TermService aur Tailscale ko high priority set karna taaki response fast ho
+          $TSProcess = Get-Process -Name "TermService" -ErrorAction SilentlyContinue
+          if ($TSProcess) { $TSProcess.PriorityClass = 'High' }
+          $TailscaleProcess = Get-Process -Name "tailscale" -ErrorAction SilentlyContinue
+          if ($TailscaleProcess) { $TailscaleProcess.PriorityClass = 'High' }
+          Write-Host "Priority updated to High."
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active with Power Process Optimization..."
+              Start-Sleep -Seconds 300
+          }
